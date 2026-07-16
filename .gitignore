@@ -1,0 +1,14 @@
+yoga_env/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+*.log
+dataset/
