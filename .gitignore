@@ -12,3 +12,4 @@ Thumbs.db
 !.vscode/settings.json
 *.log
 dataset/
+model/yoga_model.pkl
