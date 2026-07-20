@@ -5,13 +5,16 @@ import os
 
 from pose_detection.detector import PoseDetector
 from model.classifier import train_model
-from utils.angles import extract_angles, ANGLE_COLUMNS
+from utils.angles import extract_features, FEATURE_COLUMNS
 
 CSV_PATH = "pose_data.csv"
 MODEL_PATH = "model/yoga_model.pkl"
 
 # How many corrections to collect before auto-retraining
 AUTO_RETRAIN_EVERY = 5
+
+# Below this confidence, show "Uncertain" instead of committing to a guess.
+CONFIDENCE_THRESHOLD = 0.40
 
 # Load trained model
 model = joblib.load(MODEL_PATH)
@@ -23,14 +26,12 @@ detector = PoseDetector()
 cap = cv2.VideoCapture(0)
 
 correction_count = 0
-last_angles = None  # angles from the most recent frame with a detected pose
+last_features = None
 
 
-def save_correction(angles, correct_label):
-    """Append a corrected sample to the CSV so the model can learn from it.
-    Works for both existing poses and brand new pose names."""
-    row = angles + [correct_label]
-    row_df = pd.DataFrame([row], columns=ANGLE_COLUMNS + ["label"])
+def save_correction(features, correct_label):
+    row = features + [correct_label]
+    row_df = pd.DataFrame([row], columns=FEATURE_COLUMNS + ["label"])
 
     file_exists = os.path.isfile(CSV_PATH)
     row_df.to_csv(CSV_PATH, mode="a", header=not file_exists, index=False)
@@ -38,7 +39,6 @@ def save_correction(angles, correct_label):
 
 
 def retrain_and_reload():
-    """Retrain the model on the updated CSV and reload it into memory."""
     global model
     print("Retraining model on updated data... this may take a moment.")
     model, accuracy = train_model(csv_path=CSV_PATH, model_path=MODEL_PATH)
@@ -60,10 +60,10 @@ while True:
 
     if results.pose_landmarks:
 
-        angles = extract_angles(results.pose_landmarks.landmark)
-        last_angles = angles
+        features = extract_features(results.pose_landmarks.landmark)
+        last_features = features
 
-        input_data = pd.DataFrame([angles], columns=ANGLE_COLUMNS)
+        input_data = pd.DataFrame([features], columns=FEATURE_COLUMNS)
 
         prediction = model.predict(input_data)
         pose_name = prediction[0]
@@ -71,8 +71,11 @@ while True:
         if hasattr(model, "predict_proba"):
             probs = model.predict_proba(input_data)[0]
             confidence = max(probs)
+
+            if confidence < CONFIDENCE_THRESHOLD:
+                pose_name = "Uncertain"
     else:
-        last_angles = None
+        last_features = None
 
     label_text = f"Pose: {pose_name}"
     if confidence is not None:
@@ -90,7 +93,7 @@ while True:
         break
 
     elif key == ord('c'):
-        if last_angles is None:
+        if last_features is None:
             print("No pose detected right now, can't save a correction.")
         else:
             correct_label = input(
@@ -98,7 +101,7 @@ while True:
             ).strip()
 
             if correct_label:
-                save_correction(last_angles, correct_label)
+                save_correction(last_features, correct_label)
                 correction_count += 1
 
                 if correction_count >= AUTO_RETRAIN_EVERY:

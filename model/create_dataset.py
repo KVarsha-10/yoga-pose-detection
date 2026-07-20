@@ -6,7 +6,7 @@ import sys
 
 # Allow importing from utils/ when running this script directly
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from utils.angles import extract_angles, ANGLE_COLUMNS
+from utils.angles import extract_features, FEATURE_COLUMNS
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=True)
@@ -38,14 +38,14 @@ for label in os.listdir(DATASET_PATH):
         results = pose.process(image_rgb)
 
         if results.pose_landmarks:
-            angles = extract_angles(results.pose_landmarks.landmark)
-            angles.append(label)
-            data.append(angles)
+            features = extract_features(results.pose_landmarks.landmark)
+            features.append(label)
+            data.append(features)
             image_count += 1
 
     print(f"  -> {image_count} usable images")
 
-columns = ANGLE_COLUMNS + ["label"]
+columns = FEATURE_COLUMNS + ["label"]
 df = pd.DataFrame(data, columns=columns)
 df.to_csv(OUTPUT_CSV, index=False)
 
