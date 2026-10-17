@@ -1,4 +1,4 @@
-opencv-python
+opencv-contrib-python==4.11.0.86
 mediapipe==0.10.14
 pandas
 scikit-learn
