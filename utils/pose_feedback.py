@@ -31,50 +31,137 @@ def build_reference_profiles(dataframe, angle_columns):
     return profiles
 
 
-def compare_angles_to_examples(pose_name, features, feature_columns, profiles):
-    """Return one actionable angle cue for the largest clear deviation."""
+def compare_angles_to_examples(
+    pose_name,
+    features,
+    feature_columns,
+    profiles
+):
     pose_profile = profiles.get(pose_name)
+
     if not pose_profile:
-        return {"text": "No angle examples are available for this pose.", "speech": None}
+        return {
+            "text": "No angle examples are available.",
+            "speech": None
+        }
 
     deviations = []
-    for column, (display_name, joint_type) in ANGLE_LABELS.items():
+
+    for column, (_, joint_type) in ANGLE_LABELS.items():
+
         reference = pose_profile.get(column)
+
         if reference is None:
             continue
-        value = float(features[feature_columns.index(column)])
-        low, high = reference["low"], reference["high"]
-        if low <= value <= high:
-            continue
 
-        outside_by = low - value if value < low else value - high
-        spread = max(high - low, 8.0)
-        median_difference = value - reference["median"]
+        value = float(
+            features[
+                feature_columns.index(column)
+            ]
+        )
 
-        if joint_type in ("elbow", "knee"):
-            if median_difference < 0:
-                cue = f"{display_name} is about {abs(median_difference):.0f} degrees more bent than examples; gently straighten it."
-            else:
-                cue = f"{display_name} is about {median_difference:.0f} degrees straighter than examples; bend it slightly."
-        elif joint_type == "hip":
-            if median_difference < 0:
-                cue = f"{display_name} is about {abs(median_difference):.0f} degrees more folded than examples; ease the fold slightly."
-            else:
-                cue = f"{display_name} is about {median_difference:.0f} degrees more open than examples; fold a little more."
-        else:
-            direction = "lower" if median_difference < 0 else "higher"
-            cue = (
-                f"{display_name} angle is about {abs(median_difference):.0f} degrees {direction} "
-                "than examples; adjust your arm gently toward the reference."
+        median = reference["median"]
+
+        deviations.append(
+            (
+                abs(value - median),
+                column,
+                value - median
             )
-
-        deviations.append((outside_by / spread, cue))
+        )
 
     if not deviations:
         return {
-            "text": "Joint angles are within the range of the training examples.",
-            "speech": None,
+            "text": "Good alignment.",
+            "speech": "Good alignment."
         }
 
-    _, cue = max(deviations, key=lambda item: item[0])
-    return {"text": cue, "speech": cue}
+    deviations.sort(reverse=True)
+
+    _, column, difference = deviations[0]
+
+    # -------- GARUDASANA --------
+
+    if pose_name.lower().strip() == "garudasana":
+
+    if "shoulder" in column:
+
+        cue = (
+            "Lift your elbows to shoulder height and keep your forearms crossed."
+        )
+
+    elif "elbow" in column:
+
+        cue = (
+            "Wrap your forearms more tightly and keep the elbows lifted."
+        )
+
+    elif "knee" in column:
+
+        cue = (
+            "Cross the thighs firmly and sink a little deeper into the standing leg."
+        )
+
+    elif "hip" in column:
+
+        cue = (
+            "Keep your hips centered and lengthen through the spine."
+        )
+
+    else:
+
+        cue = (
+            "Maintain balance and keep the Eagle pose compact and steady."
+        )
+
+    return {
+        "text": cue,
+        "speech": cue
+    }
+
+    # -------- GENERAL POSES --------
+
+    if "elbow" in column:
+
+        cue = (
+            "Straighten the elbows slightly."
+            if difference < 0
+            else
+            "Bend the elbows slightly."
+        )
+
+    elif "shoulder" in column:
+
+        cue = (
+            "Raise the arms a little higher."
+            if difference < 0
+            else
+            "Lower the shoulders slightly."
+        )
+
+    elif "knee" in column:
+
+        cue = (
+            "Bend the knees slightly."
+            if difference > 0
+            else
+            "Straighten the knees gently."
+        )
+
+    elif "hip" in column:
+
+        cue = (
+            "Open the hips a little more."
+            if difference > 0
+            else
+            "Soften the hip fold slightly."
+        )
+
+    else:
+
+        cue = "Adjust the pose gently."
+
+    return {
+        "text": cue,
+        "speech": cue
+    }

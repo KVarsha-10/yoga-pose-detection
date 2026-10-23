@@ -18,9 +18,9 @@ ROOT = Path(__file__).resolve().parent
 CSV_PATH = ROOT / "pose_data.csv"
 MODEL_PATH = ROOT / "model" / "yoga_model.pkl"
 REFERENCE_DIR = ROOT / "pose_references"
-CONFIDENCE_THRESHOLD = 0.40
-VOTE_WINDOW = 15
-REQUIRED_TARGET_VOTES = 12
+CONFIDENCE_THRESHOLD = 0.30
+VOTE_WINDOW = 10
+REQUIRED_TARGET_VOTES = 7
 
 
 def load_poses():
@@ -76,6 +76,7 @@ class Tutor:
         self.feedback_key = None
         self.last_features = None
         self.last_detected = "Camera is starting"
+        self.last_speech_time = 0
 
     def prompt(self, text):
         self.prompt_id += 1
@@ -210,7 +211,10 @@ class Tutor:
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
                 key = (11, 12, 23, 24, 25, 26, 27, 28)
-                visible = sum(float(landmarks[i].visibility) for i in key) / len(key) >= .5
+                visible = sum(
+    float(landmarks[i].visibility)
+    for i in key
+) / len(key) >= .35
                 if visible:
                     features = self.features_fn(landmarks)
                     row = self.pd.DataFrame([features], columns=self.feature_columns)
@@ -262,8 +266,11 @@ class Tutor:
             self.state["feedback"] = "Compared with dataset examples: " + feedback["text"]
             speech = feedback.get("speech")
             key = re.sub(r"\b\d+(?:\.\d+)?\b", "", speech or "").strip()
-            if speech and key != self.feedback_key:
-                self.prompt(speech); self.feedback_key = key
+
+        if (speech and key != self.feedback_key and time.monotonic() - self.last_speech_time > 4):
+            self.prompt(speech)
+            self.feedback_key = key
+            self.last_speech_time = time.monotonic()
         else:
             self.feedback_key = None
             self.state["feedback"] = ("Move back until your shoulders, hips, knees, and ankles are visible."
@@ -374,16 +381,37 @@ def video_feed():
                 break
     return Response(frames(), mimetype="multipart/x-mixed-replace; boundary=frame", headers={"Cache-Control": "no-cache"})
 
-
+DATASET_DIR = ROOT / "dataset"
 @app.get("/reference/<path:pose_name>")
 def reference(pose_name):
-    if pose_name not in POSES: return "", 404
-    for ext in (".jpg", ".jpeg", ".png", ".webp"):
-        path = REFERENCE_DIR / (slug(pose_name) + ext)
-        if path.is_file(): return send_file(path)
-    return "", 404
+
+    folder = DATASET_DIR / pose_name
+
+    if not folder.exists():
+        return "", 404
+
+    images = []
+
+    for pattern in (
+        "*.jpg",
+        "*.jpeg",
+        "*.png",
+        "*.webp",
+    ):
+        images.extend(folder.glob(pattern))
+
+    if not images:
+        return "", 404
+
+    return send_file(sorted(images)[0])
 
 
 if __name__ == "__main__":
-    REFERENCE_DIR.mkdir(exist_ok=True)
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True, use_reloader=False)
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        debug=False,
+        threaded=True,
+        use_reloader=False
+    )
+
