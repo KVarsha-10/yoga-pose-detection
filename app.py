@@ -1,191 +1,389 @@
+"""Flask based browser yoga tutor. Run with ``python app.py``."""
+
+from __future__ import annotations
+
+import csv
+import math
 import os
+import re
+import threading
 import time
 from collections import deque
+from pathlib import Path
 
-import cv2
-import joblib
-import pandas as pd
-
-from pose_detection.detector import PoseDetector
-from model.classifier import train_model
-from utils.angles import extract_features, FEATURE_COLUMNS
+from flask import Flask, Response, jsonify, render_template, request, send_file
 
 
-CSV_PATH = "pose_data.csv"
-MODEL_PATH = "model/yoga_model.pkl"
-
-# Tutor settings: require a stable prediction, then hold the target pose.
+ROOT = Path(__file__).resolve().parent
+CSV_PATH = ROOT / "pose_data.csv"
+MODEL_PATH = ROOT / "model" / "yoga_model.pkl"
+REFERENCE_DIR = ROOT / "pose_references"
 CONFIDENCE_THRESHOLD = 0.40
 VOTE_WINDOW = 15
 REQUIRED_TARGET_VOTES = 12
-HOLD_SECONDS = 2.0
-AUTO_RETRAIN_EVERY = 5
 
 
-def load_pose_sequence(csv_path):
-    """Use all dataset labels once, in a consistent alphabetical order."""
-    labels = pd.read_csv(csv_path, usecols=["label"])["label"].dropna().unique()
-    return sorted((str(label) for label in labels), key=str.casefold)
+def load_poses():
+    with CSV_PATH.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "label" not in reader.fieldnames:
+            raise ValueError("pose_data.csv must contain a 'label' column")
+        return sorted({r["label"].strip() for r in reader if r.get("label", "").strip()}, key=str.casefold)
 
 
-POSE_SEQUENCE = load_pose_sequence(CSV_PATH)
-if not POSE_SEQUENCE:
-    raise ValueError(f"No pose labels found in {CSV_PATH}.")
-
-model = joblib.load(MODEL_PATH)
-model_labels = {str(label) for label in getattr(model, "classes_", [])}
-missing_labels = [label for label in POSE_SEQUENCE if label not in model_labels]
-if missing_labels:
-    raise ValueError(
-        "The saved model and pose_data.csv have different pose labels. "
-        "Retrain from the project folder with "
-        "'.\\venv\\Scripts\\python.exe model\\classifier.py', then relaunch. "
-        f"Missing from model: {', '.join(missing_labels)}"
-    )
-
-detector = PoseDetector()
-cap = cv2.VideoCapture(0)
-
-if not cap.isOpened():
-    detector.pose.close()
-    raise RuntimeError("Could not open webcam. Check that it is connected and not in use.")
-
-correction_count = 0
-last_features = None
-pose_index = 0
-vote_history = deque(maxlen=VOTE_WINDOW)
-hold_started_at = None
+def slug(value):
+    return re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
 
 
-def save_correction(features, correct_label):
-    row_df = pd.DataFrame([features + [correct_label]], columns=FEATURE_COLUMNS + ["label"])
-    file_exists = os.path.isfile(CSV_PATH)
-    row_df.to_csv(CSV_PATH, mode="a", header=not file_exists, index=False)
-    print(f"Saved correction: '{correct_label}'")
+app = Flask(__name__)
+POSES = load_poses()
 
 
-def retrain_and_reload():
-    global model
-    print("Retraining model on updated data... this may take a moment.")
-    model, accuracy = train_model(csv_path=CSV_PATH, model_path=MODEL_PATH)
-    print(f"Retrained. New accuracy on held-out split: {accuracy:.2f}")
+class Tutor:
+    """Owns one camera, pose detector, and model for the active browser session."""
 
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.cap = None
+        self.detector = None
+        self.model = None
+        self.pd = None
+        self.np = None
+        self.cv2 = None
+        self.features_fn = None
+        self.feature_columns = None
+        self.angle_columns = None
+        self.compare_angles = None
+        self.profiles = None
+        self.training = None
+        self.sequence = []
+        self.index = 0
+        self.hold_seconds = 10
+        self.rest_seconds = 0
+        self.hold_started = None
+        self.rest_until = None
+        self.paused = False
+        self.active = False
+        self.complete = False
+        self.votes = deque(maxlen=VOTE_WINDOW)
+        self.probabilities = deque(maxlen=5)
+        self.frame_bytes = None
+        self.frame_updated = threading.Condition(self.lock)
+        self.state = {}
+        self.prompt_id = 0
+        self.feedback_key = None
+        self.last_features = None
+        self.last_detected = "Camera is starting"
 
-def show_text(frame, text, y, color=(255, 255, 255), scale=0.65):
-    cv2.putText(frame, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
+    def prompt(self, text):
+        self.prompt_id += 1
+        self.state["prompt_id"] = self.prompt_id
+        self.state["prompt"] = text
 
+    def target(self):
+        return self.sequence[self.index] if self.index < len(self.sequence) else None
 
-print(f"Tutor sequence: {len(POSE_SEQUENCE)} poses, alphabetical by pose name.")
-print(f"First target: {POSE_SEQUENCE[0]}")
-print("Controls: [c] correct prediction   [r] retrain   [s] restart sequence   [q] quit")
+    def public_state(self):
+        with self.lock:
+            now = time.monotonic()
+            remaining = self.hold_seconds
+            mode = "waiting"
+            if self.complete:
+                mode = "complete"
+                remaining = 0
+            elif not self.active:
+                mode = "idle"
+            elif self.paused:
+                mode = "paused"
+            elif self.rest_until is not None:
+                remaining = max(0, math.ceil(self.rest_until - now))
+                mode = "rest" if remaining else "waiting"
+            elif self.hold_started is not None:
+                remaining = max(0, math.ceil(self.hold_seconds - (now - self.hold_started)))
+                mode = "holding"
+            state = dict(self.state)
+            state.update({
+                "active": self.active, "complete": self.complete, "paused": self.paused,
+                "mode": mode, "target": self.target(), "step": min(self.index + 1, len(self.sequence)),
+                "total": len(self.sequence), "hold_seconds": self.hold_seconds,
+                "remaining": remaining, "detected": self.last_detected,
+            })
+            return state
 
-try:
-    while True:
-        success, frame = cap.read()
-        if not success:
-            print("Could not read a webcam frame; stopping the tutor.")
-            break
+    def start(self, sequence, hold_seconds, rest_seconds):
+        self.stop()
+        import cv2
+        import joblib
+        import numpy as np
+        import pandas as pd
+        from pose_detection.detector import PoseDetector
+        from utils.angles import ANGLE_COLUMNS, FEATURE_COLUMNS, extract_features
+        from utils.pose_feedback import build_reference_profiles, compare_angles_to_examples
 
-        frame, results = detector.detect_pose(frame)
-        detected_pose = "No Pose Detected"
-        displayed_pose = detected_pose
-        confidence = None
-        current_features = None
+        model = joblib.load(MODEL_PATH)
+        missing = set(POSES) - {str(x) for x in getattr(model, "classes_", [])}
+        if missing:
+            raise RuntimeError("Saved model does not include every pose in pose_data.csv; retrain it first.")
+        training = pd.read_csv(CSV_PATH)
+        detector = PoseDetector()
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(0)
+        if not cap.isOpened():
+            cap.release()
+            detector.pose.close()
+            raise RuntimeError("Could not open webcam. Check that it is connected and not in use.")
+        with self.lock:
+            self.cv2, self.np, self.pd = cv2, np, pd
+            self.model, self.training, self.detector, self.cap = model, training, detector, cap
+            self.features_fn, self.feature_columns = extract_features, FEATURE_COLUMNS
+            self.angle_columns, self.compare_angles = ANGLE_COLUMNS, compare_angles_to_examples
+            self.profiles = build_reference_profiles(training, ANGLE_COLUMNS)
+            self.sequence, self.index = sequence, 0
+            self.hold_seconds, self.rest_seconds = hold_seconds, rest_seconds
+            self.hold_started, self.rest_until = None, None
+            self.paused, self.complete, self.active = False, False, True
+            self.votes.clear(); self.probabilities.clear()
+            self.frame_bytes = None
+            self.feedback_key = None
+            self.last_detected = "Waiting for you to enter the camera view"
+            self.state = {"feedback": "Stand where your full body is visible.", "confidence": None,
+                          "prompt": "", "prompt_id": 0}
+            self.prompt(f"Starting your sequence. First pose: {sequence[0]}. Hold for {hold_seconds} seconds.")
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._capture_loop, daemon=True, name="yoga-camera")
+            self.thread.start()
 
-        if results.pose_landmarks:
-            current_features = extract_features(results.pose_landmarks.landmark)
-            input_data = pd.DataFrame([current_features], columns=FEATURE_COLUMNS)
-            detected_pose = str(model.predict(input_data)[0])
+    def stop(self):
+        self.stop_event.set()
+        thread = self.thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        with self.lock:
+            if self.cap is not None:
+                self.cap.release(); self.cap = None
+            if self.detector is not None:
+                try: self.detector.pose.close()
+                except Exception: pass
+                self.detector = None
+            self.thread = None
+            self.active = False
+            self.paused = False
+            self.hold_started = None
+            self.rest_until = None
+            self.votes.clear(); self.probabilities.clear()
 
-            if hasattr(model, "predict_proba"):
-                probabilities = model.predict_proba(input_data)[0]
-                confidence = float(max(probabilities))
+    def advance(self, skipped=False):
+        self.index += 1
+        self.hold_started = None
+        self.votes.clear(); self.probabilities.clear()
+        self.feedback_key = None
+        target = self.target()
+        if target is None:
+            self.complete = True
+            self.prompt("Sequence complete. Well done. Take a moment to notice how you feel.")
+            self.state["feedback"] = "You completed every pose in your sequence. Well done!"
+            return
+        if self.rest_seconds:
+            self.rest_until = time.monotonic() + self.rest_seconds
+            self.prompt(f"Pose complete. Rest for {self.rest_seconds} seconds. Next pose: {target}. After your rest, hold it for {self.hold_seconds} seconds.")
+            self.state["feedback"] = f"Rest break. Next: {target}."
+        else:
+            self.rest_until = None
+            self.prompt(f"Next pose: {target}. Hold for {self.hold_seconds} seconds.")
+            self.state["feedback"] = f"Now move into {target}."
 
-            displayed_pose = detected_pose
-            if confidence is not None and confidence < CONFIDENCE_THRESHOLD:
-                displayed_pose = "Uncertain"
-
-        last_features = current_features
-        confident_pose = (
-            detected_pose
-            if current_features is not None
-            and (confidence is None or confidence >= CONFIDENCE_THRESHOLD)
-            else None
-        )
-        vote_history.append(confident_pose)
-
-        now = time.monotonic()
-        target = POSE_SEQUENCE[pose_index] if pose_index < len(POSE_SEQUENCE) else None
-        target_votes = sum(pose == target for pose in vote_history) if target else 0
-        stable_target = (
-            target is not None
-            and len(vote_history) == VOTE_WINDOW
-            and target_votes >= REQUIRED_TARGET_VOTES
-            and confident_pose == target
-        )
-
-        if stable_target:
-            if hold_started_at is None:
-                hold_started_at = now
-            held_seconds = now - hold_started_at
-            if held_seconds >= HOLD_SECONDS:
-                pose_index += 1
-                vote_history.clear()
-                hold_started_at = None
-                target = POSE_SEQUENCE[pose_index] if pose_index < len(POSE_SEQUENCE) else None
-                if target is None:
-                    print(f"Sequence complete! You completed all {len(POSE_SEQUENCE)} poses.")
+    def _capture_loop(self):
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            with self.lock:
+                cap, detector = self.cap, self.detector
+            if cap is None or detector is None:
+                break
+            ok, frame = cap.read()
+            if not ok:
+                with self.lock: self.state["feedback"] = "Camera frame unavailable. Check camera permissions."
+                time.sleep(.1); continue
+            frame = self.cv2.flip(frame, 1)
+            frame, results = detector.detect_pose(frame)
+            detected, confidence, features, visible = "No pose detected", None, None, False
+            if results.pose_landmarks:
+                landmarks = results.pose_landmarks.landmark
+                key = (11, 12, 23, 24, 25, 26, 27, 28)
+                visible = sum(float(landmarks[i].visibility) for i in key) / len(key) >= .5
+                if visible:
+                    features = self.features_fn(landmarks)
+                    row = self.pd.DataFrame([features], columns=self.feature_columns)
+                    probs = self.model.predict_proba(row)[0]
+                    with self.lock:
+                        self.probabilities.append(probs)
+                        probs = self.np.mean(self.probabilities, axis=0)
+                    best = int(self.np.argmax(probs))
+                    detected, confidence = str(self.model.classes_[best]), float(probs[best])
                 else:
-                    print(f"Next pose ({pose_index + 1}/{len(POSE_SEQUENCE)}): {target}")
-        else:
-            hold_started_at = None
-            held_seconds = 0.0
-
-        show_text(frame, f"Detected: {displayed_pose}", 35, (0, 255, 0))
-        if confidence is not None:
-            show_text(frame, f"Confidence: {confidence * 100:.0f}%", 65)
-
-        if target is not None:
-            show_text(frame, f"Target ({pose_index + 1}/{len(POSE_SEQUENCE)}): {target}", 105, (0, 220, 255))
-            if stable_target:
-                show_text(frame, f"Hold steady: {min(held_seconds, HOLD_SECONDS):.1f}/{HOLD_SECONDS:.1f}s", 140)
-            elif target_votes:
-                show_text(frame, f"Pose stabilizing: {target_votes}/{REQUIRED_TARGET_VOTES}", 140)
+                    detected = "Move back so your full body is visible"
+                    with self.lock: self.probabilities.clear()
             else:
-                show_text(frame, "Move into the target pose", 140)
-            next_pose = POSE_SEQUENCE[pose_index + 1] if pose_index + 1 < len(POSE_SEQUENCE) else "Sequence complete"
-            show_text(frame, f"After this: {next_pose}", 175)
+                with self.lock: self.probabilities.clear()
+            with self.lock:
+                self.last_detected = detected
+                self.last_features = features
+                self._update_logic(detected if confidence is not None and confidence >= CONFIDENCE_THRESHOLD else None,
+                                   confidence, features, visible)
+                label = f"Detected: {detected}" + (f"  ·  {confidence:.0%}" if confidence is not None else "")
+                self.cv2.rectangle(frame, (0, 0), (frame.shape[1], 42), (22, 44, 38), -1)
+                self.cv2.putText(frame, label[:90], (16, 28), self.cv2.FONT_HERSHEY_SIMPLEX,
+                                 .65, (235, 245, 235), 2)
+                ok, jpeg = self.cv2.imencode(".jpg", frame, [int(self.cv2.IMWRITE_JPEG_QUALITY), 82])
+                if ok:
+                    self.frame_bytes = jpeg.tobytes()
+                    self.frame_updated.notify_all()
+            time.sleep(max(0, .035 - (time.monotonic() - started)))
+
+    def _update_logic(self, prediction, confidence, features, visible):
+        if not self.active or self.complete or self.paused:
+            return
+        now, target = time.monotonic(), self.target()
+        self.votes.append(prediction)
+        self.state["confidence"] = confidence
+        if self.rest_until is not None:
+            left = max(0, math.ceil(self.rest_until - now))
+            if left:
+                self.state["feedback"] = f"Rest break · {left} seconds. Next pose: {target}."
+                self.votes.clear()
+                return
+            self.rest_until = None
+            self.votes.clear()
+            self.prompt(f"Rest complete. Now do {target}. Hold for {self.hold_seconds} seconds.")
+        stable = (len(self.votes) == VOTE_WINDOW and sum(x == target for x in self.votes) >= REQUIRED_TARGET_VOTES
+                  and prediction == target)
+        if prediction == target and features is not None:
+            feedback = self.compare_angles(target, features, self.feature_columns, self.profiles)
+            self.state["feedback"] = "Compared with dataset examples: " + feedback["text"]
+            speech = feedback.get("speech")
+            key = re.sub(r"\b\d+(?:\.\d+)?\b", "", speech or "").strip()
+            if speech and key != self.feedback_key:
+                self.prompt(speech); self.feedback_key = key
         else:
-            show_text(frame, f"All {len(POSE_SEQUENCE)} poses completed! Press [s] to restart.", 105, (0, 255, 0))
+            self.feedback_key = None
+            self.state["feedback"] = ("Move back until your shoulders, hips, knees, and ankles are visible."
+                                       if not visible else f"Move into {target} to begin the hold.")
+        if stable:
+            if self.hold_started is None:
+                self.hold_started = now
+                self.prompt(f"Good. You are in {target}. Hold for {self.hold_seconds} seconds.")
+            elapsed = now - self.hold_started
+            left = max(0, math.ceil(self.hold_seconds - elapsed))
+            self.state["remaining"] = left
+            if left in (5, 3, 2, 1) and getattr(self, "last_countdown", None) != left:
+                self.prompt(f"{left} seconds remaining."); self.last_countdown = left
+            if elapsed >= self.hold_seconds:
+                self.advance()
+        else:
+            self.hold_started = None
+            self.state["remaining"] = self.hold_seconds
 
-        show_text(frame, "[c] correct  [r] retrain  [s] restart  [q] quit", frame.shape[0] - 20, scale=0.5)
-        cv2.imshow("Yoga Pose Tutor", frame)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("s"):
-            pose_index = 0
-            vote_history.clear()
-            hold_started_at = None
-            print(f"Sequence restarted. First target: {POSE_SEQUENCE[0]}")
-        elif key == ord("c"):
-            if last_features is None:
-                print("No pose detected right now, can't save a correction.")
-            else:
-                correct_label = input(
-                    f"Model said '{displayed_pose}'. Type the CORRECT pose name: "
-                ).strip()
-                if correct_label:
-                    save_correction(last_features, correct_label)
-                    correction_count += 1
-                    if correction_count >= AUTO_RETRAIN_EVERY:
-                        retrain_and_reload()
-                        correction_count = 0
-        elif key == ord("r"):
-            retrain_and_reload()
+tutor = Tutor()
 
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
-    detector.pose.close()
+
+@app.get("/")
+def index():
+    return render_template("index.html", poses=POSES)
+
+
+@app.get("/api/state")
+def api_state():
+    return jsonify(tutor.public_state())
+
+
+@app.post("/api/start")
+def api_start():
+    data = request.get_json(silent=True) or {}
+    sequence = data.get("sequence")
+    if not isinstance(sequence, list) or not sequence:
+        return jsonify(error="Choose at least one pose."), 400
+    if any(p not in POSES for p in sequence):
+        return jsonify(error="The sequence includes an unknown pose."), 400
+    try:
+        hold = int(data.get("hold_seconds", 10)); rest = int(data.get("rest_seconds", 0))
+        if not 1 <= hold <= 120 or not 0 <= rest <= 120: raise ValueError
+    except (TypeError, ValueError):
+        return jsonify(error="Hold and rest must be whole seconds (hold 1–120, rest 0–120)."), 400
+    try:
+        tutor.start(sequence, hold, rest)
+        return jsonify(tutor.public_state())
+    except Exception as exc:
+        tutor.stop()
+        return jsonify(error=str(exc)), 500
+
+
+@app.post("/api/stop")
+def api_stop():
+    tutor.stop()
+    with tutor.lock:
+        tutor.complete = False
+        tutor.state = {"feedback": "Session ended.", "prompt": "", "prompt_id": tutor.prompt_id}
+    return jsonify(ok=True)
+
+
+@app.post("/api/pause")
+def api_pause():
+    data = request.get_json(silent=True) or {}
+    with tutor.lock:
+        if not tutor.active: return jsonify(error="No active session."), 400
+        tutor.paused = bool(data.get("paused"))
+        tutor.hold_started = None
+        tutor.votes.clear(); tutor.probabilities.clear()
+        tutor.state["feedback"] = "Practice paused. Resume when ready." if tutor.paused else "Practice resumed. Find your pose again."
+        tutor.prompt("Practice paused." if tutor.paused else "Practice resumed. Find your pose again.")
+    return jsonify(tutor.public_state())
+
+
+@app.post("/api/skip")
+def api_skip():
+    with tutor.lock:
+        if tutor.active and not tutor.complete: tutor.advance(skipped=True)
+    return jsonify(tutor.public_state())
+
+
+@app.post("/api/correct")
+def api_correct():
+    data = request.get_json(silent=True) or {}
+    label = data.get("label")
+    with tutor.lock:
+        if label not in POSES: return jsonify(error="Choose a pose from the list."), 400
+        if tutor.last_features is None: return jsonify(error="No full-body pose is visible yet."), 400
+        row = tutor.pd.DataFrame([tutor.last_features + [label]], columns=tutor.feature_columns + ["label"])
+        row.to_csv(CSV_PATH, mode="a", header=False, index=False)
+        tutor.state["feedback"] = f"Saved correction as {label}. Retrain the model to include corrections."
+    return jsonify(ok=True, feedback=tutor.state["feedback"])
+
+
+@app.get("/video_feed")
+def video_feed():
+    def frames():
+        while True:
+            with tutor.frame_updated:
+                tutor.frame_updated.wait_for(lambda: tutor.frame_bytes is not None or not tutor.active, timeout=1)
+                frame = tutor.frame_bytes
+                active = tutor.active
+            if frame:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n" + frame + b"\r\n"
+            elif not active:
+                break
+    return Response(frames(), mimetype="multipart/x-mixed-replace; boundary=frame", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/reference/<path:pose_name>")
+def reference(pose_name):
+    if pose_name not in POSES: return "", 404
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        path = REFERENCE_DIR / (slug(pose_name) + ext)
+        if path.is_file(): return send_file(path)
+    return "", 404
+
+
+if __name__ == "__main__":
+    REFERENCE_DIR.mkdir(exist_ok=True)
+    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True, use_reloader=False)
