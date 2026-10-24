@@ -84,29 +84,29 @@ def compare_angles_to_examples(
 
     if pose_name.lower().strip() == "garudasana":
 
-    if "shoulder" in column:
+        if "shoulder" in column:
 
-        cue = (
-            "Lift your elbows to shoulder height and keep your forearms crossed."
-        )
+            cue = (
+                "Lift your elbows to shoulder height and keep your forearms crossed."
+            )
 
-    elif "elbow" in column:
+        elif "elbow" in column:
 
-        cue = (
-            "Wrap your forearms more tightly and keep the elbows lifted."
-        )
+            cue = (
+                "Wrap your forearms more tightly and keep the elbows lifted."
+            )
 
-    elif "knee" in column:
+        elif "knee" in column:
 
-        cue = (
-            "Cross the thighs firmly and sink a little deeper into the standing leg."
-        )
+            cue = (
+                "Cross the thighs firmly and sink a little deeper into the standing leg."
+            )
 
-    elif "hip" in column:
+        elif "hip" in column:
 
-        cue = (
-            "Keep your hips centered and lengthen through the spine."
-        )
+            cue = (
+                "Keep your hips centered and lengthen through the spine."
+            )
 
     else:
 

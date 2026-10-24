@@ -128,7 +128,9 @@
     $('modeBadge').textContent = ({holding: 'HOLD STEADY', rest: 'REST BREAK', paused: 'PAUSED', complete: 'COMPLETE', waiting: 'GET READY'})[state.mode] || 'GET READY';
     $('timerLabel').textContent = state.mode === 'rest' ? 'REST TIMER' : 'HOLD TIMER';
     $('pauseButton').innerHTML = state.paused ? '▶ <span>Resume</span>' : 'Ⅱ <span>Pause</span>';
-    if (state.active && !state.complete && $('cameraFeed').naturalWidth) $('cameraPlaceholder').classList.add('hidden');
+    if (state.active && !state.complete && (state.frame_ready || $('cameraFeed').naturalWidth > 0)) {
+      $('cameraPlaceholder').classList.add('hidden');
+    }
     if (state.target) setReference(state.target);
     if (state.complete) { $('cameraStatus').textContent = 'Sequence complete'; clearInterval(pollHandle); }
   }

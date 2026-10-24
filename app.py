@@ -70,6 +70,7 @@ class Tutor:
         self.votes = deque(maxlen=VOTE_WINDOW)
         self.probabilities = deque(maxlen=5)
         self.frame_bytes = None
+        self.frame_sequence = 0
         self.frame_updated = threading.Condition(self.lock)
         self.state = {}
         self.prompt_id = 0
@@ -110,6 +111,7 @@ class Tutor:
                 "mode": mode, "target": self.target(), "step": min(self.index + 1, len(self.sequence)),
                 "total": len(self.sequence), "hold_seconds": self.hold_seconds,
                 "remaining": remaining, "detected": self.last_detected,
+                "frame_ready": self.frame_sequence > 0,
             })
             return state
 
@@ -146,6 +148,7 @@ class Tutor:
             self.paused, self.complete, self.active = False, False, True
             self.votes.clear(); self.probabilities.clear()
             self.frame_bytes = None
+            self.frame_sequence = 0
             self.feedback_key = None
             self.last_detected = "Waiting for you to enter the camera view"
             self.state = {"feedback": "Stand where your full body is visible.", "confidence": None,
@@ -241,6 +244,7 @@ class Tutor:
                 ok, jpeg = self.cv2.imencode(".jpg", frame, [int(self.cv2.IMWRITE_JPEG_QUALITY), 82])
                 if ok:
                     self.frame_bytes = jpeg.tobytes()
+                    self.frame_sequence += 1
                     self.frame_updated.notify_all()
             time.sleep(max(0, .035 - (time.monotonic() - started)))
 
@@ -370,12 +374,18 @@ def api_correct():
 @app.get("/video_feed")
 def video_feed():
     def frames():
+        last_sequence = 0
         while True:
             with tutor.frame_updated:
-                tutor.frame_updated.wait_for(lambda: tutor.frame_bytes is not None or not tutor.active, timeout=1)
+                tutor.frame_updated.wait_for(
+                    lambda: tutor.frame_sequence > last_sequence or not tutor.active,
+                    timeout=2,
+                )
                 frame = tutor.frame_bytes
+                sequence = tutor.frame_sequence
                 active = tutor.active
-            if frame:
+            if frame and sequence > last_sequence:
+                last_sequence = sequence
                 yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n" + frame + b"\r\n"
             elif not active:
                 break
@@ -384,26 +394,30 @@ def video_feed():
 DATASET_DIR = ROOT / "dataset"
 @app.get("/reference/<path:pose_name>")
 def reference(pose_name):
+    extensions = {".jpg", ".jpeg", ".png", ".webp"}
 
-    folder = DATASET_DIR / pose_name
+    # Prefer curated images stored with the documented slugged filenames.
+    for extension in sorted(extensions):
+        reference_image = REFERENCE_DIR / f"{slug(pose_name)}{extension}"
+        if reference_image.is_file():
+            return send_file(reference_image)
 
-    if not folder.exists():
-        return "", 404
+    # Support extracted datasets with class-named folders, regardless of case.
+    if DATASET_DIR.is_dir():
+        folders = [
+            folder for folder in DATASET_DIR.rglob("*")
+            if folder.is_dir() and folder.name.casefold() == pose_name.casefold()
+        ]
+        images = sorted(
+            image
+            for folder in folders
+            for image in folder.rglob("*")
+            if image.is_file() and image.suffix.casefold() in extensions
+        )
+        if images:
+            return send_file(images[0])
 
-    images = []
-
-    for pattern in (
-        "*.jpg",
-        "*.jpeg",
-        "*.png",
-        "*.webp",
-    ):
-        images.extend(folder.glob(pattern))
-
-    if not images:
-        return "", 404
-
-    return send_file(sorted(images)[0])
+    return "", 404
 
 
 if __name__ == "__main__":
